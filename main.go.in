@@ -1,0 +1,37 @@
+package main
+
+import (
+	"fmt"
+	"github.com/robfig/cron/v3"
+	"os/exec"
+)
+
+//goland:noinspection GoSnakeCaseUsage
+var ftp_sync FTP_SYNC
+
+//goland:noinspection SpellCheckingInspection,GoImportUsedAsName,GoUnhandledErrorResult
+func main() {
+	ftp_sync.ExcludePaths = []string{"\\.git"}
+	ftp_sync.ListFilesProxy = "http://192.168.0.1:8080"
+	ftp_sync.DownloadProxy = "http://192.168.0.1:8080"
+    ftp_sync.Wget = false
+    ftp_sync.TLS = false
+	sync()
+	c := cron.New(cron.WithSeconds())
+	c.AddFunc("0 0 0 * * *", func() {
+		sync()
+	})
+	c.Start()
+	select {}
+}
+
+func sync() {
+	exec.Command("cls")
+	ftp_sync.Synchronization(
+		"192.168.0.1",
+		"administrator",
+		"123",
+		"C:\\ftp_sync",
+		"/")
+	fmt.Printf("[%s] Done.\n", ftp_sync.Now())
+}
