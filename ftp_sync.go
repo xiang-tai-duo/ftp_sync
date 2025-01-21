@@ -41,13 +41,20 @@ type FTP_SYNC struct {
 	DownloadProxy   string
 	TLS             bool
 	Wget            bool
+	WgetRetry       int
 }
+
+var FtpSync = FTP_SYNC{}
 
 //goland:noinspection GoSnakeCaseUsage
 type FTP_FILE_INFO struct {
 	name string
 	path string
 	size int64
+}
+
+func init() {
+	FtpSync.WgetRetry = MAX_TRY
 }
 
 //goland:noinspection GoUnhandledErrorResult
@@ -269,7 +276,7 @@ func (sync FTP_SYNC) wget(ftpFilePath string, saveTo string) (err error) {
 					taskkill.Run()
 					ftpPath := strings.ReplaceAll(ftpFilePath, string(os.PathSeparator), "/")
 					args := "-d "
-					args += fmt.Sprintf("-c --tries=%d ", MAX_TRY)
+					args += fmt.Sprintf("-c --tries=%d ", sync.WgetRetry)
 					args += fmt.Sprintf("-O \"%s\" ", saveTo)
 					args += fmt.Sprintf("\"ftp://%s:%s@%s%s\" ", sync.UserName, sync.Password, sync.Host, ftpPath)
 					if batchFile, err := os.Create(WGET_CMD); err == nil {
