@@ -21,9 +21,9 @@ import (
 
 //goland:noinspection GoUnusedConst,GoSnakeCaseUsage
 const (
-	MAX_TRY      = 10
+	DEFAULT_TRY  = 10
 	WAIT_SECONDS = 10
-	FTP_TIMEOUT  = 60 * time.Second
+	FTP_TIMEOUT  = 5 * time.Second
 	WGET_TIMEOUT = 5 * time.Minute
 	WGET_CMD     = "wget.cmd"
 	WGET_EXE     = "wget.exe"
@@ -39,6 +39,8 @@ type FTP_SYNC struct {
 	ExcludePaths    []string
 	ListFilesProxy  string
 	DownloadProxy   string
+	Retry           int
+	Timeout         time.Duration
 	TLS             bool
 	Wget            bool
 	WgetRetry       int
@@ -54,7 +56,9 @@ type FTP_FILE_INFO struct {
 }
 
 func init() {
-	FtpSync.WgetRetry = MAX_TRY
+	FtpSync.Retry = DEFAULT_TRY
+	FtpSync.Timeout = FTP_TIMEOUT
+	FtpSync.WgetRetry = DEFAULT_TRY
 }
 
 //goland:noinspection GoUnhandledErrorResult
@@ -132,7 +136,7 @@ func (sync FTP_SYNC) CreateClientWithProxy(proxyUrl string) (client *goftp.Clien
 		client, err = goftp.DialConfig(goftp.Config{
 			User:     sync.UserName,
 			Password: sync.Password,
-			Timeout:  FTP_TIMEOUT,
+			Timeout:  sync.Timeout,
 			TLSConfig: &tls.Config{
 				InsecureSkipVerify: true,
 			},
@@ -144,7 +148,7 @@ func (sync FTP_SYNC) CreateClientWithProxy(proxyUrl string) (client *goftp.Clien
 		client, err = goftp.DialConfig(goftp.Config{
 			User:        sync.UserName,
 			Password:    sync.Password,
-			Timeout:     FTP_TIMEOUT,
+			Timeout:     sync.Timeout,
 			DisableEPSV: true,
 			DialFunc:    dialFunc,
 		}, sync.Host)
@@ -156,37 +160,45 @@ func (sync FTP_SYNC) CreateClient() (client *goftp.Client, err error) {
 	return sync.CreateClientWithProxy("")
 }
 
-//goland:noinspection GoUnhandledErrorResult
+//goland:noinspection GoUnhandledErrorResult,GoDfaErrorMayBeNotNil
 func (sync FTP_SYNC) listFiles(remoteDirectory string, fileInfo func(ftpFile FTP_FILE_INFO)) {
-	directory := remoteDirectory
-	directory = strings.TrimRight(directory, "/")
-	directory = strings.TrimRight(directory, "\\")
-	if directory == "" {
-		directory = "/"
+	var client *goftp.Client
+	var err error
+	if sync.ListFilesProxy == "" {
+		client, err = sync.CreateClient()
+	} else {
+		client, err = sync.CreateClientWithProxy(sync.ListFilesProxy)
 	}
-	isExclude := false
-	if sync.ExcludePaths != nil {
-		for _, exclude := range sync.ExcludePaths {
-			if strings.EqualFold(directory, exclude) {
-				isExclude = true
+	if err == nil {
+		sync.listFilesInternal(remoteDirectory, fileInfo, client)
+		client.Close()
+	}
+}
+
+//goland:noinspection GoUnhandledErrorResult
+func (sync FTP_SYNC) listFilesInternal(remoteDirectory string, fileInfo func(ftpFile FTP_FILE_INFO), client *goftp.Client) {
+	if client != nil {
+		directory := remoteDirectory
+		directory = strings.TrimRight(directory, "/")
+		directory = strings.TrimRight(directory, "\\")
+		if directory == "" {
+			directory = "/"
+		}
+		isExclude := false
+		if sync.ExcludePaths != nil {
+			for _, exclude := range sync.ExcludePaths {
+				if strings.EqualFold(directory, exclude) {
+					isExclude = true
+				}
 			}
 		}
-	}
-	if !isExclude {
-		for retryCount := MAX_TRY; retryCount > 0; retryCount-- {
-			var client *goftp.Client
-			var err error
-			if sync.ListFilesProxy == "" {
-				client, err = sync.CreateClient()
-			} else {
-				client, err = sync.CreateClientWithProxy(sync.ListFilesProxy)
-			}
-			if err == nil {
+		if !isExclude {
+			for retryCount := sync.Retry; retryCount > 0; retryCount-- {
 				if files, err := client.ReadDir(directory); err == nil {
 					for _, file := range files {
 						fullFilePath := strings.ReplaceAll(filepath.Join(directory, file.Name()), "\\", "/")
 						if file.IsDir() {
-							sync.listFiles(fullFilePath, fileInfo)
+							sync.listFilesInternal(fullFilePath, fileInfo, client)
 						} else {
 							if fileInfo != nil {
 								fileInfo(FTP_FILE_INFO{
@@ -201,18 +213,16 @@ func (sync FTP_SYNC) listFiles(remoteDirectory string, fileInfo func(ftpFile FTP
 				} else {
 					fmt.Printf("[%s] List files from \033[97m%s\033[0m \033[91mfailed\033[0m\n", sync.Now(), sync.Host)
 				}
-				client.Close()
+				fmt.Printf("[%s] Wait %d seconds...\n", sync.Now(), WAIT_SECONDS)
+				time.Sleep(WAIT_SECONDS * time.Second)
 			}
-			fmt.Printf("[%s] Wait %d seconds...\n", sync.Now(), WAIT_SECONDS)
-			time.Sleep(WAIT_SECONDS * time.Second)
 		}
 	}
-	return
 }
 
 //goland:noinspection GoUnhandledErrorResult,GoDfaErrorMayBeNotNil
 func (sync FTP_SYNC) DownloadFile(ftpFilePath string, saveTo string) (err error) {
-	for retryCount := MAX_TRY; retryCount > 0; retryCount-- {
+	for retryCount := sync.Retry; retryCount > 0; retryCount-- {
 		var client *goftp.Client
 		if sync.DownloadProxy == "" {
 			client, err = sync.CreateClient()
