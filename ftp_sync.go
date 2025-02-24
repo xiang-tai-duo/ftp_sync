@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"ftp_sync/goftp"
@@ -20,9 +21,12 @@ import (
 
 //goland:noinspection GoUnusedConst,GoSnakeCaseUsage
 const (
-	MAX_TRY      = 10
+	DEFAULT_TRY  = 10
 	WAIT_SECONDS = 10
+	FTP_TIMEOUT  = 5 * time.Second
 	WGET_TIMEOUT = 5 * time.Minute
+	WGET_CMD     = "wget.cmd"
+	WGET_EXE     = "wget.exe"
 )
 
 //goland:noinspection GoSnakeCaseUsage
@@ -35,7 +39,15 @@ type FTP_SYNC struct {
 	ExcludePaths    []string
 	ListFilesProxy  string
 	DownloadProxy   string
+	Retry           int
+	Timeout         time.Duration
+	TLS             bool
+	Wget            bool
+	WgetRetry       int
+	DownloadCount   int
 }
+
+var FtpSync = FTP_SYNC{}
 
 //goland:noinspection GoSnakeCaseUsage
 type FTP_FILE_INFO struct {
@@ -44,10 +56,10 @@ type FTP_FILE_INFO struct {
 	size int64
 }
 
-//goland:noinspection GoSnakeCaseUsage
-type FILE_INFO_JSON []struct {
-	Name string `json:"name"`
-	Size int    `json:"size"`
+func init() {
+	FtpSync.Retry = DEFAULT_TRY
+	FtpSync.Timeout = FTP_TIMEOUT
+	FtpSync.WgetRetry = DEFAULT_TRY
 }
 
 //goland:noinspection GoUnhandledErrorResult
@@ -57,6 +69,7 @@ func (sync FTP_SYNC) Synchronization(host string, userName string, password stri
 	sync.Password = password
 	sync.LocalDirectory = localDirectory
 	sync.RemoteDirectory = remoteDirectory
+	sync.DownloadCount = 0
 	localDirectory = strings.TrimRight(localDirectory, "/")
 	localDirectory = strings.TrimRight(localDirectory, "\\")
 	remoteDirectory = strings.TrimRight(remoteDirectory, "/")
@@ -98,7 +111,11 @@ func (sync FTP_SYNC) Synchronization(host string, userName string, password stri
 			} else {
 				fmt.Printf("[%s] \033[97m%s\033[0m:%s \033[91m%s\033[0m\n[%s] \033[97m%s\033[0m: \033[92m%d\033[0m\n", sync.Now(), saveTo, space, localFileSize, sync.Now(), ftpFilePath, ftpFile.size)
 			}
-			sync.wget(ftpFile.path, saveTo)
+			if sync.Wget {
+				sync.wget(ftpFile.path, saveTo)
+			} else {
+				sync.DownloadFile(ftpFile.path, saveTo)
+			}
 		} else {
 			fmt.Printf("[%s] \033[97m%s\033[0m is \033[92mup to date\033[0m\n", sync.Now(), saveTo)
 		}
@@ -117,12 +134,27 @@ func (sync FTP_SYNC) CreateClientWithProxy(proxyUrl string) (client *goftp.Clien
 	if proxyUrl == "" {
 		dialFunc = nil
 	}
-	client, err = goftp.DialConfig(goftp.Config{
-		User:        sync.UserName,
-		Password:    sync.Password,
-		DisableEPSV: true,
-		DialFunc:    dialFunc,
-	}, sync.Host)
+	if sync.TLS {
+		client, err = goftp.DialConfig(goftp.Config{
+			User:     sync.UserName,
+			Password: sync.Password,
+			Timeout:  sync.Timeout,
+			TLSConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			TLSMode:     goftp.TLSExplicit,
+			DisableEPSV: true,
+			DialFunc:    dialFunc,
+		}, sync.Host)
+	} else {
+		client, err = goftp.DialConfig(goftp.Config{
+			User:        sync.UserName,
+			Password:    sync.Password,
+			Timeout:     sync.Timeout,
+			DisableEPSV: true,
+			DialFunc:    dialFunc,
+		}, sync.Host)
+	}
 	return
 }
 
@@ -130,37 +162,45 @@ func (sync FTP_SYNC) CreateClient() (client *goftp.Client, err error) {
 	return sync.CreateClientWithProxy("")
 }
 
-//goland:noinspection GoUnhandledErrorResult
+//goland:noinspection GoUnhandledErrorResult,GoDfaErrorMayBeNotNil
 func (sync FTP_SYNC) listFiles(remoteDirectory string, fileInfo func(ftpFile FTP_FILE_INFO)) {
-	directory := remoteDirectory
-	directory = strings.TrimRight(directory, "/")
-	directory = strings.TrimRight(directory, "\\")
-	if directory == "" {
-		directory = "/"
+	var client *goftp.Client
+	var err error
+	if sync.ListFilesProxy == "" {
+		client, err = sync.CreateClient()
+	} else {
+		client, err = sync.CreateClientWithProxy(sync.ListFilesProxy)
 	}
-	isExclude := false
-	if sync.ExcludePaths != nil {
-		for _, exclude := range sync.ExcludePaths {
-			if strings.EqualFold(directory, exclude) {
-				isExclude = true
+	if err == nil {
+		sync.listFilesInternal(remoteDirectory, fileInfo, client)
+		client.Close()
+	}
+}
+
+//goland:noinspection GoUnhandledErrorResult
+func (sync FTP_SYNC) listFilesInternal(remoteDirectory string, fileInfo func(ftpFile FTP_FILE_INFO), client *goftp.Client) {
+	if client != nil {
+		directory := remoteDirectory
+		directory = strings.TrimRight(directory, "/")
+		directory = strings.TrimRight(directory, "\\")
+		if directory == "" {
+			directory = "/"
+		}
+		isExclude := false
+		if sync.ExcludePaths != nil {
+			for _, exclude := range sync.ExcludePaths {
+				if strings.EqualFold(directory, exclude) {
+					isExclude = true
+				}
 			}
 		}
-	}
-	if !isExclude {
-		for retryCount := MAX_TRY; retryCount > 0; retryCount-- {
-			var client *goftp.Client
-			var err error
-			if sync.ListFilesProxy == "" {
-				client, err = sync.CreateClient()
-			} else {
-				client, err = sync.CreateClientWithProxy(sync.DownloadProxy)
-			}
-			if err == nil {
+		if !isExclude {
+			for retryCount := sync.Retry; retryCount > 0; retryCount-- {
 				if files, err := client.ReadDir(directory); err == nil {
 					for _, file := range files {
-						fullFilePath := filepath.Join(directory, file.Name())
+						fullFilePath := strings.ReplaceAll(filepath.Join(directory, file.Name()), "\\", "/")
 						if file.IsDir() {
-							sync.listFiles(fullFilePath, fileInfo)
+							sync.listFilesInternal(fullFilePath, fileInfo, client)
 						} else {
 							if fileInfo != nil {
 								fileInfo(FTP_FILE_INFO{
@@ -175,18 +215,16 @@ func (sync FTP_SYNC) listFiles(remoteDirectory string, fileInfo func(ftpFile FTP
 				} else {
 					fmt.Printf("[%s] List files from \033[97m%s\033[0m \033[91mfailed\033[0m\n", sync.Now(), sync.Host)
 				}
-				client.Close()
+				fmt.Printf("[%s] Wait %d seconds...\n", sync.Now(), WAIT_SECONDS)
+				time.Sleep(WAIT_SECONDS * time.Second)
 			}
-			fmt.Printf("[%s] Wait %d seconds...\n", sync.Now(), WAIT_SECONDS)
-			time.Sleep(WAIT_SECONDS * time.Second)
 		}
 	}
-	return
 }
 
 //goland:noinspection GoUnhandledErrorResult,GoDfaErrorMayBeNotNil
 func (sync FTP_SYNC) DownloadFile(ftpFilePath string, saveTo string) (err error) {
-	for retryCount := MAX_TRY; retryCount > 0; retryCount-- {
+	for retryCount := sync.Retry; retryCount > 0; retryCount-- {
 		var client *goftp.Client
 		if sync.DownloadProxy == "" {
 			client, err = sync.CreateClient()
@@ -207,6 +245,7 @@ func (sync FTP_SYNC) DownloadFile(ftpFilePath string, saveTo string) (err error)
 							})
 						progressBar.Finish()
 						if err == nil {
+							sync.DownloadCount++
 							break
 						} else {
 							fmt.Printf("[%s] Retrieve \033[97m%s\033[0m \033[91mfailed\033[0m\n", sync.Now(), ftpFilePath)
@@ -250,14 +289,14 @@ func (sync FTP_SYNC) wget(ftpFilePath string, saveTo string) (err error) {
 					taskkill.Run()
 					ftpPath := strings.ReplaceAll(ftpFilePath, string(os.PathSeparator), "/")
 					args := "-d "
-					args += fmt.Sprintf("-c --tries=%d ", MAX_TRY)
+					args += fmt.Sprintf("-c --tries=%d ", sync.WgetRetry)
 					args += fmt.Sprintf("-O \"%s\" ", saveTo)
 					args += fmt.Sprintf("\"ftp://%s:%s@%s%s\" ", sync.UserName, sync.Password, sync.Host, ftpPath)
-					if batchFile, err := os.Create("wget.cmd"); err == nil {
+					if batchFile, err := os.Create(WGET_CMD); err == nil {
 						if _, err := batchFile.WriteString(fmt.Sprintf("\"%s\" %s", wget, args)); err == nil {
 							ctx, cancel := context.WithTimeout(context.Background(), WGET_TIMEOUT)
 							defer cancel()
-							cmd := exec.CommandContext(ctx, "cmd.exe", "/c", "wget.cmd")
+							cmd := exec.CommandContext(ctx, "cmd.exe", "/c", WGET_CMD)
 							cmd.Stdout = os.Stdout
 							cmd.Stderr = os.Stderr
 							if err := cmd.Run(); err != nil {
